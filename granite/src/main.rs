@@ -220,7 +220,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
                 writeln!(
                     err,
                     "error: {} paths are claimed by more than one file; nothing was written",
-                    mp.plan.collisions.len()
+                    mp.plan.collisions.count()
                 )?;
                 print_collisions(&mut err, &mp)?;
                 return Ok(1);
@@ -402,17 +402,18 @@ fn print_plan(out: &mut impl Write, r: &PlanReport) -> std::io::Result<()> {
 
 /// The complete resolution list: every colliding path, and where each
 /// claimant lives so the user can rename one and rescan that shard.
-fn print_collisions(out: &mut impl Write, mp: &MergePlan) -> std::io::Result<()> {
+fn print_collisions(out: &mut impl Write, mp: &MergePlan) -> anyhow::Result<()> {
     let labels = &mp.plan.report.shards;
     writeln!(out)?;
     writeln!(
         out,
         "resolve by renaming all but one claimant of each path in its shard, then `granite scan` that shard:"
     )?;
-    for (path, claims) in &mp.plan.collisions {
-        let shown = pathenc::display(path);
+    for group in mp.plan.collisions.iter()? {
+        let (path, claims) = group?;
+        let shown = pathenc::display(&path);
         writeln!(out, "  {shown}")?;
-        for claim in claims {
+        for claim in &claims {
             for &i in &claim.shards {
                 writeln!(
                     out,

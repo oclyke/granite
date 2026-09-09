@@ -2,9 +2,9 @@
 //! Reads indexes only; never touches data files or hints.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -94,7 +94,7 @@ pub struct CollisionSample {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Collisions {
+pub struct CollisionStats {
     pub count: u64,
     pub sample: Vec<CollisionSample>,
 }
@@ -105,8 +105,11 @@ pub struct PlanReport {
     pub union: UnionStats,
     pub replicas: Vec<ReplicaBucket>,
     pub pairwise: Option<Vec<PairOverlap>>,
-    pub collisions: Collisions,
+    pub collisions: CollisionStats,
 }
+
+/// One record of the collision spill: encoded path, hash, shard index.
+type ClaimLine = (Vec<u8>, [u8; 32], usize);
 
 /// One hash's claim on a contested path, and the shards making it.
 #[derive(Debug, Clone)]
@@ -117,8 +120,101 @@ pub struct Claim {
 
 pub struct Plan {
     pub report: PlanReport,
-    /// Every path claimed by more than one hash, claims in ascending hash order.
-    pub collisions: BTreeMap<Vec<u8>, Vec<Claim>>,
+    pub collisions: Collisions,
+}
+
+/// Every path claimed by more than one hash. Kept on disk and streamed back
+/// rather than held in a map: merging two generations of one tree collides on
+/// every file that changed between them, so this list scales with the corpus.
+#[derive(Debug, Default)]
+pub struct Collisions {
+    /// Absent when there are none; dropping it deletes the spill.
+    spill: Option<tempfile::TempPath>,
+    count: u64,
+}
+
+impl Collisions {
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Streams every colliding path in ascending path order, its claims in
+    /// ascending hash order.
+    pub fn iter(&self) -> Result<ClaimIter> {
+        let Some(spill) = &self.spill else {
+            return Ok(ClaimIter::default());
+        };
+        let mut it = ClaimIter {
+            reader: Some(BufReader::with_capacity(
+                1 << 16,
+                File::open(spill).at(spill)?,
+            )),
+            path: spill.to_path_buf(),
+            next: None,
+        };
+        it.next = it.read_claim()?;
+        Ok(it)
+    }
+}
+
+#[derive(Default)]
+pub struct ClaimIter {
+    reader: Option<BufReader<File>>,
+    path: PathBuf,
+    /// The first claim of the next path, read ahead to find a group's end.
+    next: Option<ClaimLine>,
+}
+
+impl ClaimIter {
+    fn read_claim(&mut self) -> Result<Option<ClaimLine>> {
+        let mut line = Vec::new();
+        let read = match self.reader.as_mut() {
+            Some(r) => r.read_until(b'\n', &mut line),
+            None => return Ok(None),
+        };
+        if read.at(&self.path)? == 0 {
+            return Ok(None);
+        }
+        line.pop();
+        parse_claim(&line, &self.path).map(Some)
+    }
+
+    fn next_group(&mut self) -> Result<Option<(Vec<u8>, Vec<Claim>)>> {
+        let Some((enc, hash, idx)) = self.next.take() else {
+            return Ok(None);
+        };
+        let mut claims = vec![Claim {
+            hash,
+            shards: vec![idx],
+        }];
+        while let Some(c) = self.read_claim()? {
+            if c.0 != enc {
+                self.next = Some(c);
+                break;
+            }
+            match claims.last_mut() {
+                Some(last) if last.hash == c.1 => last.shards.push(c.2),
+                _ => claims.push(Claim {
+                    hash: c.1,
+                    shards: vec![c.2],
+                }),
+            }
+        }
+        let path = pathenc::decode(&enc).map_err(|_| corrupt(&self.path))?;
+        Ok(Some((path, claims)))
+    }
+}
+
+impl Iterator for ClaimIter {
+    type Item = Result<(Vec<u8>, Vec<Claim>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_group().transpose()
+    }
 }
 
 struct Entry {
@@ -320,12 +416,56 @@ pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
         v
     });
 
-    let collisions = find_collisions(by_path.finish().at(&tmp)?, &tmp)?;
-    let sample = collisions
+    let (collisions, sample) = find_collisions(by_path.finish().at(&tmp)?, &tmp)?;
+    let report = PlanReport {
+        shards,
+        union,
+        replicas,
+        pairwise,
+        collisions: CollisionStats {
+            count: collisions.count(),
+            sample,
+        },
+    };
+    Ok(Plan { report, collisions })
+}
+
+fn corrupt(path: &Path) -> Error {
+    Error::Malformed {
+        path: path.to_path_buf(),
+        line: 0,
+        msg: "corrupt sort spill".into(),
+    }
+}
+
+fn parse_claim(line: &[u8], tmp: &Path) -> Result<ClaimLine> {
+    let bad = || corrupt(tmp);
+    let t2 = line.iter().rposition(|&b| b == b'\t').ok_or_else(bad)?;
+    let t1 = line[..t2]
         .iter()
-        .take(COLLISION_SAMPLE)
-        .map(|(p, claims)| CollisionSample {
-            path: pathenc::display(p),
+        .rposition(|&b| b == b'\t')
+        .ok_or_else(bad)?;
+    let hash = hex::decode_hash(&line[t1 + 1..t2]).ok_or_else(bad)?;
+    let idx: usize = std::str::from_utf8(&line[t2 + 1..])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(bad)?;
+    Ok((line[..t1].to_vec(), hash, idx))
+}
+
+/// Copies a colliding group back out in the same `encoded_path \t hex \t shard`
+/// form it arrived in, so `ClaimIter` can re-read it with `parse_claim`.
+fn emit_collision(
+    enc: &[u8],
+    claims: &[Claim],
+    w: &mut impl Write,
+    sample: &mut Vec<CollisionSample>,
+    tmp: &Path,
+) -> Result<()> {
+    if sample.len() < COLLISION_SAMPLE {
+        let path = pathenc::decode(enc).map_err(|_| corrupt(tmp))?;
+        sample.push(CollisionSample {
+            path: pathenc::display(&path),
             claims: claims
                 .iter()
                 .map(|c| ClaimSample {
@@ -333,66 +473,64 @@ pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
                     shards: c.shards.clone(),
                 })
                 .collect(),
-        })
-        .collect();
-    let report = PlanReport {
-        shards,
-        union,
-        replicas,
-        pairwise,
-        collisions: Collisions {
-            count: collisions.len() as u64,
-            sample,
-        },
-    };
-    Ok(Plan { report, collisions })
+        });
+    }
+    for c in claims {
+        for &i in &c.shards {
+            w.write_all(enc).at(tmp)?;
+            writeln!(w, "\t{}\t{i}", hex::encode(&c.hash)).at(tmp)?;
+        }
+    }
+    Ok(())
 }
 
 /// Lines are `encoded_path \t hex \t shard`, sorted, so a path's claims are
-/// adjacent and in ascending hash order.
+/// adjacent and in ascending hash order. Only one group and the sample are
+/// held at a time; the rest goes straight back to disk.
 fn find_collisions(
     sorted: impl Iterator<Item = std::io::Result<Vec<u8>>>,
     tmp: &Path,
-) -> Result<BTreeMap<Vec<u8>, Vec<Claim>>> {
-    let corrupt = || Error::Malformed {
-        path: tmp.to_path_buf(),
-        line: 0,
-        msg: "corrupt sort spill".into(),
-    };
-    let mut out = BTreeMap::new();
-    let mut cur: Option<(Vec<u8>, Vec<Claim>)> = None;
-    let mut flush = |cur: Option<(Vec<u8>, Vec<Claim>)>| -> Result<()> {
+) -> Result<(Collisions, Vec<CollisionSample>)> {
+    let file = tempfile::Builder::new()
+        .prefix(".granite-collisions.")
+        .tempfile_in(tmp)
+        .at(tmp)?;
+    let mut count = 0u64;
+    let mut sample = Vec::new();
+    {
+        let mut w = BufWriter::with_capacity(1 << 16, file.as_file());
+        let mut cur: Option<(Vec<u8>, Vec<Claim>)> = None;
+        for line in sorted {
+            let (enc, hash, idx) = parse_claim(&line.at(tmp)?, tmp)?;
+            match &mut cur {
+                Some((p, claims)) if *p == enc => match claims.last_mut() {
+                    Some(c) if c.hash == hash => c.shards.push(idx),
+                    _ => claims.push(Claim {
+                        hash,
+                        shards: vec![idx],
+                    }),
+                },
+                _ => {
+                    if let Some((p, claims)) = cur.take().filter(|(_, c)| c.len() > 1) {
+                        count += 1;
+                        emit_collision(&p, &claims, &mut w, &mut sample, tmp)?;
+                    }
+                    cur = Some((
+                        enc,
+                        vec![Claim {
+                            hash,
+                            shards: vec![idx],
+                        }],
+                    ));
+                }
+            }
+        }
         if let Some((p, claims)) = cur.filter(|(_, c)| c.len() > 1) {
-            out.insert(pathenc::decode(&p).map_err(|_| corrupt())?, claims);
+            count += 1;
+            emit_collision(&p, &claims, &mut w, &mut sample, tmp)?;
         }
-        Ok(())
-    };
-    for line in sorted {
-        let line = line.at(tmp)?;
-        let t2 = line.iter().rposition(|&b| b == b'\t').ok_or_else(corrupt)?;
-        let t1 = line[..t2]
-            .iter()
-            .rposition(|&b| b == b'\t')
-            .ok_or_else(corrupt)?;
-        let (enc, hex_part, idx_part) = (&line[..t1], &line[t1 + 1..t2], &line[t2 + 1..]);
-        let hash = hex::decode_hash(hex_part).ok_or_else(corrupt)?;
-        let idx: usize = std::str::from_utf8(idx_part)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(corrupt)?;
-        if cur.as_ref().is_none_or(|(p, _)| p.as_slice() != enc) {
-            flush(cur.take())?;
-            cur = Some((enc.to_vec(), Vec::new()));
-        }
-        let claims = &mut cur.as_mut().ok_or_else(corrupt)?.1;
-        match claims.last_mut() {
-            Some(c) if c.hash == hash => c.shards.push(idx),
-            _ => claims.push(Claim {
-                hash,
-                shards: vec![idx],
-            }),
-        }
+        w.flush().at(tmp)?;
     }
-    flush(cur)?;
-    Ok(out)
+    let spill = (count > 0).then(|| file.into_temp_path());
+    Ok((Collisions { spill, count }, sample))
 }

@@ -339,7 +339,7 @@ pub fn execute(
     if mp.blocked_by_collisions(opts.layout) {
         return Err(Error::Usage(format!(
             "{} paths are claimed by more than one file; resolve them before merging",
-            mp.plan.collisions.len()
+            mp.plan.collisions.count()
         )));
     }
     let out_layout = Layout::in_shard(into);

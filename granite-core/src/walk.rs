@@ -101,10 +101,12 @@ impl Walk<'_> {
     fn walk(&self, work_tx: mpsc::SyncSender<(Vec<u8>, PathBuf)>, item_tx: mpsc::SyncSender<Item>) {
         let root = self.root;
         let excluded: Vec<PathBuf> = self.exclude.iter().map(|e| root.join(e)).collect();
-        let mut it = walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .sort_by_file_name()
-            .into_iter();
+        // Deliberately unsorted: asking walkdir to sort makes it buffer a whole
+        // directory's entries before yielding any, which is the only part of a
+        // scan that scales with the largest directory rather than the sort
+        // budget. Nothing downstream depends on walk order; `index` and `hints`
+        // are both sorted afterwards, and `skipped` is documented as walk order.
+        let mut it = walkdir::WalkDir::new(root).follow_links(false).into_iter();
         while let Some(next) = it.next() {
             let entry = match next {
                 Ok(e) => e,

@@ -362,7 +362,15 @@ fn collisions_block_paths_layout_with_locations() {
     let out = f.base.join("out");
     let opts = merge_opts();
     let mp = merge::prepare(&roots, &out, &opts).unwrap();
-    let claims = &mp.plan.collisions[&b"notes.txt"[..]];
+    let groups: Vec<(Vec<u8>, Vec<plan::Claim>)> = mp
+        .plan
+        .collisions
+        .iter()
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(groups.len() as u64, mp.plan.collisions.count());
+    let (_, claims) = groups.iter().find(|(p, _)| p == b"notes.txt").unwrap();
     let by_shards: Vec<&[usize]> = claims.iter().map(|c| c.shards.as_slice()).collect();
     assert!(
         by_shards.contains(&&[0, 1][..]) && by_shards.contains(&&[2][..]),

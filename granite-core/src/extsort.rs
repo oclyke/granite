@@ -65,7 +65,7 @@ impl Sorter {
                 mem: std::mem::take(&mut self.buf).into_iter(),
                 runs: Vec::new(),
                 heap: BinaryHeap::new(),
-                last: None,
+                pending: None,
                 _tmp: self.tmp,
             });
         }
@@ -85,7 +85,7 @@ impl Sorter {
             mem: Vec::new().into_iter(),
             runs,
             heap,
-            last: None,
+            pending: None,
             _tmp: self.tmp,
         })
     }
@@ -111,22 +111,27 @@ pub(crate) struct Sorted {
     mem: std::vec::IntoIter<Vec<u8>>,
     runs: Vec<BufReader<File>>,
     heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
-    last: Option<Vec<u8>>,
+    pending: Option<Vec<u8>>,
     _tmp: TempDir,
 }
 
 impl Sorted {
+    /// Yields one line behind the merge so that the line held back for the
+    /// duplicate check is the same allocation later handed to the caller;
+    /// comparing against a retained copy would clone every record.
     fn next_merged(&mut self) -> io::Result<Option<Vec<u8>>> {
         loop {
             let Some(Reverse((line, i))) = self.heap.pop() else {
-                return Ok(None);
+                return Ok(self.pending.take());
             };
             if let Some(next) = next_line(&mut self.runs[i])? {
                 self.heap.push(Reverse((next, i)));
             }
-            if self.last.as_ref() != Some(&line) {
-                self.last = Some(line.clone());
-                return Ok(Some(line));
+            if self.pending.as_deref() == Some(&line[..]) {
+                continue;
+            }
+            if let Some(out) = self.pending.replace(line) {
+                return Ok(Some(out));
             }
         }
     }
