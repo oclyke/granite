@@ -86,7 +86,7 @@ enum Cmd {
         /// Hardlink multiple paths of one hash to each other within the output
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
         dedupe_links: bool,
-        /// Print the plan and renames; write nothing
+        /// Print the plan and any collisions; write nothing
         #[arg(long)]
         dry_run: bool,
         /// Location of the sources' indexes when kept outside the shards
@@ -210,8 +210,20 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             let mut out = std::io::stdout().lock();
             if dry_run {
                 print_plan(&mut out, &mp.plan.report)?;
-                print_renames(&mut out, &mp)?;
+                if mp.blocked_by_collisions(opts.layout) {
+                    print_collisions(&mut out, &mp)?;
+                }
                 return Ok(0);
+            }
+            if mp.blocked_by_collisions(opts.layout) {
+                let mut err = std::io::stderr().lock();
+                writeln!(
+                    err,
+                    "error: {} paths are claimed by more than one file; nothing was written",
+                    mp.plan.collisions.len()
+                )?;
+                print_collisions(&mut err, &mp)?;
+                return Ok(1);
             }
             let r = merge::execute(&mp, &into, &opts, &mut log)?;
             writeln!(
@@ -363,12 +375,18 @@ fn print_plan(out: &mut impl Write, r: &PlanReport) -> std::io::Result<()> {
     if r.collisions.count > 0 {
         writeln!(
             out,
-            "  paths claimed by more than one hash; each claimant will be renamed with a ~hash suffix"
+            "  paths claimed by more than one file; merge --layout paths refuses until these are renamed"
         )?;
         for c in &r.collisions.sample {
             writeln!(out, "  {}", c.path)?;
-            for h in &c.hashes {
-                writeln!(out, "      {h}")?;
+            for claim in &c.claims {
+                for &i in &claim.shards {
+                    writeln!(
+                        out,
+                        "      {}  {}/{}",
+                        claim.hash, r.shards[i].label, c.path
+                    )?;
+                }
             }
         }
         if r.collisions.count as usize > r.collisions.sample.len() {
@@ -382,16 +400,28 @@ fn print_plan(out: &mut impl Write, r: &PlanReport) -> std::io::Result<()> {
     Ok(())
 }
 
-fn print_renames(out: &mut impl Write, mp: &MergePlan) -> std::io::Result<()> {
+/// The complete resolution list: every colliding path, and where each
+/// claimant lives so the user can rename one and rescan that shard.
+fn print_collisions(out: &mut impl Write, mp: &MergePlan) -> std::io::Result<()> {
+    let labels = &mp.plan.report.shards;
     writeln!(out)?;
-    writeln!(out, "renames: {}", mp.renames.len())?;
-    for r in &mp.renames {
-        writeln!(
-            out,
-            "  {} -> {}",
-            pathenc::display(&r.path),
-            pathenc::display(&r.renamed)
-        )?;
+    writeln!(
+        out,
+        "resolve by renaming all but one claimant of each path in its shard, then `granite scan` that shard:"
+    )?;
+    for (path, claims) in &mp.plan.collisions {
+        let shown = pathenc::display(path);
+        writeln!(out, "  {shown}")?;
+        for claim in claims {
+            for &i in &claim.shards {
+                writeln!(
+                    out,
+                    "      {}  {}/{shown}",
+                    hex_encode(&claim.hash),
+                    labels[i].label
+                )?;
+            }
+        }
     }
     Ok(())
 }

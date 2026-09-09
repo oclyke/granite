@@ -287,20 +287,14 @@ message).
 A merge output directory is itself a shard: it receives a `.granite/index`
 describing what was written.
 
-### 10.1 Collision renames (`paths` layout)
+### 10.1 Path collisions (`paths` layout)
 
-When a path is claimed by more than one hash across the inputs, **every**
-claimant is written under a renamed path: `~` plus the first `n` hex
-characters of its hash inserted before the final component's extension
-(`IMG_001.jpg` → `IMG_001~1e0f9c3a.jpg`; `README` → `README~1e0f9c3a`). An
-extension is the part of the final component from its last `.` that is not
-at position 0. `n` is 8, or 16 if two claimants share the first 8 hex
-characters, or 64 if they share 16.
-
-Inverse rule: when computing collisions, a final component whose stem ends in
-`~` plus 8, 16, or 64 hex characters that are a prefix of the record's own
-hash is treated as claiming the path without that suffix. This makes merge
-compose: `merge(merge(A, B), C)` equals `merge(A, B, C)`.
+A path is a location in the output, and one location holds one file. When
+the inputs claim one path for more than one hash, a merge in `paths` layout
+writes nothing and reports every such path with the shard and path of each
+claimant. The user resolves it by renaming claimants in their source shards
+and rescanning those shards. No automatic renaming is performed, so the
+output tree contains exactly the paths that appear in the inputs.
 
 ### 10.2 `hash` layout
 

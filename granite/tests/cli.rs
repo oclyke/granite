@@ -155,7 +155,21 @@ fn plan_json_and_dry_run() {
         .output()
         .unwrap();
     assert!(dry.status.success());
-    assert!(String::from_utf8_lossy(&dry.stdout).contains("renames: 2"));
+    let text = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        text.contains(&format!("{}/same.txt", a.display()))
+            && text.contains(&format!("{}/same.txt", b.display()))
+    );
+    let refused = granite()
+        .arg("merge")
+        .arg(&a)
+        .arg(&b)
+        .arg("--into")
+        .arg(&into)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("same.txt"));
     assert!(!into.exists());
 }
 

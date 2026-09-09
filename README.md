@@ -83,11 +83,11 @@ replicas      hashes             bytes
 pairwise overlap      hashes             bytes
   [0] x [1]           9194       99980345600
 
-path collisions: 3
-  paths claimed by more than one hash; each claimant will be renamed with a ~hash suffix
+path collisions: 1
+  paths claimed by more than one file; merge --layout paths refuses until these are renamed
   2014/notes.txt
-      18ff5e4a…
-      e3d6cfa0…
+      18ff5e4a…  /mnt/drive-a/2014/notes.txt
+      e3d6cfa0…  ~/granite-indexes/DVD_2014.index/2014/notes.txt
 ```
 
 "Only here" is the number you cannot afford to lose. `--json` emits the same
@@ -106,17 +106,32 @@ wrote 44120 files (401220034711 bytes), linked 3, already present 0, failed 0
 fingerprint 9b31…
 ```
 
-When one path is claimed by two different files, **all** claimants are
-renamed with a hash suffix: `notes.txt` becomes `notes~18ff5e4a.txt` and
-`notes~e3d6cfa0.txt`. Renaming every claimant, not just the "loser", is
-what makes the result independent of argument order.
+When one path is claimed by two different files, merge writes nothing and
+lists each claimant with its location:
+
+```
+$ granite merge /mnt/drive-a /mnt/drive-b --into /tank/photos
+error: 1 paths are claimed by more than one file; nothing was written
+
+resolve by renaming all but one claimant of each path in its shard, then `granite scan` that shard:
+  2014/notes.txt
+      18ff5e4a…  /mnt/drive-a/2014/notes.txt
+      e3d6cfa0…  /mnt/drive-b/2014/notes.txt
+$ mv /mnt/drive-b/2014/notes.txt /mnt/drive-b/2014/notes-b.txt
+$ granite scan /mnt/drive-b
+$ granite merge /mnt/drive-a /mnt/drive-b --into /tank/photos
+```
+
+A path is only a location, not identity, so renaming changes nothing about
+what the collection contains. `plan` shows collisions ahead of time, and
+`--layout hash` cannot collide at all.
 
 Every copy is hash-verified. A file whose bytes do not match its index entry
 is reported and left as a temp file; the merge continues and exits 3. A
 re-run skips anything already present and correct, so a crashed merge is
 resumed by running it again.
 
-`--dry-run` prints the plan and the rename list and writes nothing. `--link`
+`--dry-run` prints the plan, and the collision list if any, and writes nothing. `--link`
 hardlinks from sources on the same device instead of copying. `--layout hash`
 writes each distinct content once at `objects/<xx>/<hash>` with a
 `.granite/paths` index mapping hashes to their paths; nothing can collide.
@@ -132,7 +147,7 @@ $ granite verify /tank/photos
 index scanned at 2026-09-09T14:02:11Z
 matched 453114
   missing   2014/IMG_0007.CR2
-  changed   notes~18ff5e4a.txt  index 18ff5e4a…  disk 6a9f75ee…
+  changed   2014/notes.txt  index 18ff5e4a…  disk 6a9f75ee…
 missing 1, unindexed 0, changed 1, unreadable 0
 $ echo $?
 3

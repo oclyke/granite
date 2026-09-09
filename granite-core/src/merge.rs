@@ -1,13 +1,12 @@
 //! `merge`: materialise the union of N shards (§7.3).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::collide::{prefix_needed, renamed};
 use crate::error::{Error, IoContext, Result};
 use crate::extsort::Sorter;
 use crate::fsutil::{self, fsync_dir, write_atomic};
@@ -32,21 +31,20 @@ pub struct MergeOptions {
     pub sort_budget: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct Rename {
-    pub path: Vec<u8>,
-    pub hash: [u8; 32],
-    pub renamed: Vec<u8>,
-}
-
 pub struct MergePlan {
     pub plan: Plan,
-    /// Sorted by path, then hash; empty in `hash` layout.
-    pub renames: Vec<Rename>,
     roots: Vec<PathBuf>,
     indexes: Vec<PathBuf>,
-    /// Hex prefix length used per colliding path.
-    prefix_len: BTreeMap<Vec<u8>, usize>,
+}
+
+impl MergePlan {
+    /// Path collisions block the `paths` layout: a path is a location in the
+    /// output, and one location holds one file. The user resolves them by
+    /// renaming in a source shard and rescanning it. The `hash` layout has no
+    /// path collisions.
+    pub fn blocked_by_collisions(&self, layout: OutputLayout) -> bool {
+        layout == OutputLayout::Paths && !self.plan.collisions.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,27 +132,10 @@ pub fn prepare(roots: &[PathBuf], into: &Path, opts: &MergeOptions) -> Result<Me
         },
     )?;
 
-    let mut renames = Vec::new();
-    let mut prefix_len = BTreeMap::new();
-    if opts.layout == OutputLayout::Paths {
-        for (path, hashes) in &plan.collisions {
-            let n = prefix_needed(hashes);
-            prefix_len.insert(path.clone(), n);
-            for h in hashes {
-                renames.push(Rename {
-                    path: path.clone(),
-                    hash: *h,
-                    renamed: renamed(path, h, n),
-                });
-            }
-        }
-    }
     Ok(MergePlan {
         plan,
-        renames,
         roots: roots.to_vec(),
         indexes,
-        prefix_len,
     })
 }
 
@@ -355,6 +336,12 @@ pub fn execute(
     opts: &MergeOptions,
     log: &mut dyn FnMut(&str),
 ) -> Result<MergeReport> {
+    if mp.blocked_by_collisions(opts.layout) {
+        return Err(Error::Usage(format!(
+            "{} paths are claimed by more than one file; resolve them before merging",
+            mp.plan.collisions.len()
+        )));
+    }
     let out_layout = Layout::in_shard(into);
     fs::create_dir_all(&out_layout.dir).at(&out_layout.dir)?;
     let mut out_index = Sorter::new(&out_layout.dir, opts.sort_budget).at(&out_layout.dir)?;
@@ -380,24 +367,21 @@ pub fn execute(
     };
     let mut stream = plan::MergeStream::open(&mp.indexes)?;
 
-    // Group state: the source chosen for the current hash, the canonical paths
-    // already handled, and the first output path holding it (for dedupe links).
+    // Group state: the source chosen for the current hash and the first output
+    // path holding it (for dedupe links).
     let mut cur: Option<([u8; 32], PathBuf, Option<PathBuf>)> = None;
-    let mut seen_paths: HashSet<Vec<u8>> = HashSet::new();
+    let mut last_path: Option<Vec<u8>> = None;
 
-    while let Some(u) = stream.next()? {
-        let new_group = cur.as_ref().is_none_or(|(h, _, _)| *h != u.hash);
+    while let Some((idx, rec)) = stream.next()? {
+        let new_group = cur.as_ref().is_none_or(|(h, _, _)| *h != rec.hash);
         if new_group {
-            cur = Some((u.hash, mp.roots[u.idx].join(bytes_path(&u.source)), None));
-            seen_paths.clear();
-        }
-        if !seen_paths.insert(u.path.clone()) {
+            cur = Some((rec.hash, mp.roots[idx].join(bytes_path(&rec.path)), None));
+        } else if last_path.as_deref() == Some(&rec.path[..]) {
             continue;
         }
+        last_path = Some(rec.path.clone());
         if let Some(pi) = paths_index.as_mut() {
-            let mut line = Vec::new();
-            line_into(&u.hash, u.size, &u.path, &mut line);
-            pi.push(line).at(&paths_file)?;
+            pi.push(rec.line()).at(&paths_file)?;
         }
 
         let out_rel = match opts.layout {
@@ -405,17 +389,14 @@ pub fn execute(
                 if !new_group {
                     continue;
                 }
-                hash_layout_path(&u.hash)
+                hash_layout_path(&rec.hash)
             }
-            OutputLayout::Paths => match mp.prefix_len.get(&u.path) {
-                Some(&n) => renamed(&u.path, &u.hash, n),
-                None => u.path.clone(),
-            },
+            OutputLayout::Paths => rec.path.clone(),
         };
         let Some((hash, src, first_out)) = cur.as_mut() else {
             continue;
         };
-        match writer.place(&out_rel, src, hash, u.size, first_out.as_deref()) {
+        match writer.place(&out_rel, src, hash, rec.size, first_out.as_deref()) {
             Outcome::Failed(reason) => {
                 report.failed.push(Failure {
                     path: out_rel,
@@ -434,7 +415,7 @@ pub fn execute(
             *first_out = Some(into.join(bytes_path(&out_rel)));
         }
         let mut line = Vec::new();
-        line_into(hash, u.size, &out_rel, &mut line);
+        line_into(hash, rec.size, &out_rel, &mut line);
         out_index.push(line).at(&out_layout.dir)?;
     }
 

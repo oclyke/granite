@@ -5,16 +5,19 @@ satisfied literally, and what was chosen.
 
 ## Deviations
 
-**Collision-renamed paths are canonicalised on read.** The spec's rename rule
-("rename every claimant") loses the information that `notes~18ff5e4a.txt`
-once claimed `notes.txt`, so a second merge would treat it as a distinct
-path and `merge(merge(A,B),C)` would differ from `merge(A,B,C)` whenever
-C also claims `notes.txt`. Property 2 cannot hold without an inverse rule.
-So: a final component whose stem ends in `~` plus 8, 16 or 64 hex characters
-that are a prefix of the record's own hash is treated as claiming the
-unsuffixed path. Only a prior granite merge produces such a name. Plan
-counts materialised paths after canonicalisation, so plan still matches
-merge. Documented in FORMAT.md §10.1.
+**Path collisions are an error, not a rename.** The spec renames every
+claimant of a contested path with a `~hash` suffix. That rule cannot be
+associative on its own: after `merge(A, B)` the renamed files no longer
+claim the original path, so `merge(merge(A, B), C)` differs from
+`merge(A, B, C)` whenever C also claims it. Making it associative needs an
+inverse rule that recognises granite's own suffixes, which is more
+machinery than the problem deserves. Instead, `merge --layout paths` refuses
+when any path has more than one claimant and prints each claimant's shard
+and path. Since a path is a location and not identity, the user resolves a
+collision by renaming one claimant in its shard and rescanning that shard;
+nothing about the collection changes. Merge is then trivially associative
+and order-independent. `--layout hash` is unaffected. Exit code is 1, as
+the inputs need fixing before the command can be carried out.
 
 **Names the filesystem aliases are a merge failure, not an "existing" hit.**
 APFS folds Unicode normalisation and, by default, case. Writing `café`

@@ -11,7 +11,6 @@ pub mod scan;
 pub mod shard;
 pub mod verify;
 
-mod collide;
 mod extsort;
 mod fsutil;
 mod hash;

@@ -128,11 +128,10 @@ fn fixture() -> Fixture {
         &b,
         &[
             (b"photos/2019/IMG_001.jpg", b"jpeg-one"),
-            (b"notes.txt", b"notes version B"),
+            (b"notes-b.txt", b"notes version B"),
             (b"zero/c", b""),
             (b"unicode/cafe\xcc\x81.txt", b"accent"),
             (b"only-b.bin", b"exclusive to b"),
-            (b"collide3.dat", b"c3 from b"),
         ],
     );
     tree(
@@ -140,8 +139,7 @@ fn fixture() -> Fixture {
         &[
             (b"unrelated/x", b"no overlap at all"),
             (b"unrelated/y", b"none"),
-            (b"notes.txt", b"notes version C"),
-            (b"collide3.dat", b"c3 from c"),
+            (b"notes.txt", b"notes version A"),
         ],
     );
     tree(&base.join("empty"), &[]);
@@ -177,9 +175,10 @@ fn merge_is_order_independent() {
     for o in &outputs[1..] {
         assert_eq!(o, &outputs[0]);
     }
-    let names: Vec<&[u8]> = outputs[0].keys().map(Vec::as_slice).collect();
-    assert_eq!(names.iter().filter(|n| n.starts_with(b"notes~")).count(), 3);
-    assert!(!names.contains(&&b"notes.txt"[..]));
+    assert_eq!(
+        outputs[0].get(&b"notes.txt"[..]).map(Vec::as_slice),
+        Some(&b"notes version A"[..])
+    );
 }
 
 #[test]
@@ -283,7 +282,7 @@ fn plan_matches_merge() {
         p.report.union.deduplicated_bytes,
         distinct.values().sum::<u64>()
     );
-    assert_eq!(p.report.collisions.count, 2);
+    assert_eq!(p.report.collisions.count, 0);
     assert_eq!(p.report.shards[3].files, 0);
     let verified = verify::verify(
         &out,
@@ -348,6 +347,42 @@ fn interrupted_scan_resumes() {
 }
 
 #[test]
+fn collisions_block_paths_layout_with_locations() {
+    let f = fixture();
+    let d = f.base.join("d");
+    tree(
+        &d,
+        &[
+            (b"notes.txt", b"notes version D"),
+            (b"only-b.bin", b"exclusive to b"),
+        ],
+    );
+    do_scan(&d, true);
+    let roots = vec![f.shards[0].clone(), f.shards[2].clone(), d.clone()];
+    let out = f.base.join("out");
+    let opts = merge_opts();
+    let mp = merge::prepare(&roots, &out, &opts).unwrap();
+    let claims = &mp.plan.collisions[&b"notes.txt"[..]];
+    let by_shards: Vec<&[usize]> = claims.iter().map(|c| c.shards.as_slice()).collect();
+    assert!(
+        by_shards.contains(&&[0, 1][..]) && by_shards.contains(&&[2][..]),
+        "{claims:?}"
+    );
+    assert!(mp.blocked_by_collisions(OutputLayout::Paths));
+    assert!(merge::execute(&mp, &out, &opts, &mut |_| {}).is_err());
+    assert!(!out.exists());
+
+    let hashed = MergeOptions {
+        layout: OutputLayout::Hash,
+        ..merge_opts()
+    };
+    let mp = merge::prepare(&roots, &out, &hashed).unwrap();
+    assert!(!mp.blocked_by_collisions(OutputLayout::Hash));
+    let r = merge::execute(&mp, &out, &hashed, &mut |_| {}).unwrap();
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+}
+
+#[test]
 fn hash_layout_has_no_collisions() {
     let f = fixture();
     let out = f.base.join("out");
@@ -356,7 +391,6 @@ fn hash_layout_has_no_collisions() {
         ..merge_opts()
     };
     let mp = merge::prepare(&f.shards, &out, &opts).unwrap();
-    assert!(mp.renames.is_empty());
     let r = merge::execute(&mp, &out, &opts, &mut |_| {}).unwrap();
     assert!(r.failed.is_empty(), "{:?}", r.failed);
     assert_eq!(r.written, mp.plan.report.union.distinct_hashes);

@@ -2,14 +2,13 @@
 //! Reads indexes only; never touches data files or hints.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::collide;
 use crate::error::{Error, IoContext, Result};
 use crate::extsort::Sorter;
 use crate::index::{IndexReader, Record};
@@ -82,9 +81,16 @@ pub struct PairOverlap {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ClaimSample {
+    pub hash: String,
+    /// Indexes into `PlanReport::shards`.
+    pub shards: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CollisionSample {
     pub path: String,
-    pub hashes: Vec<String>,
+    pub claims: Vec<ClaimSample>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,10 +108,17 @@ pub struct PlanReport {
     pub collisions: Collisions,
 }
 
+/// One hash's claim on a contested path, and the shards making it.
+#[derive(Debug, Clone)]
+pub struct Claim {
+    pub hash: [u8; 32],
+    pub shards: Vec<usize>,
+}
+
 pub struct Plan {
     pub report: PlanReport,
-    /// Every path claimed by more than one hash, with those hashes in ascending order.
-    pub collisions: BTreeMap<Vec<u8>, Vec<[u8; 32]>>,
+    /// Every path claimed by more than one hash, claims in ascending hash order.
+    pub collisions: BTreeMap<Vec<u8>, Vec<Claim>>,
 }
 
 struct Entry {
@@ -159,10 +172,7 @@ impl MergeStream {
         self.readers[idx].path()
     }
 
-    /// Records come out hash-major (paths within a hash in no useful order once
-    /// canonicalised). `Union.path` is the canonical path; `source` is the path
-    /// as it exists in shard `idx`.
-    pub(crate) fn next(&mut self) -> Result<Option<Union>> {
+    pub(crate) fn next(&mut self) -> Result<Option<(usize, Record)>> {
         let Some(Reverse(Entry { idx, rec, .. })) = self.heap.pop() else {
             return Ok(None);
         };
@@ -173,23 +183,8 @@ impl MergeStream {
                 rec: next,
             }));
         }
-        let path = collide::canonical(&rec.path, &rec.hash).unwrap_or_else(|| rec.path.clone());
-        Ok(Some(Union {
-            idx,
-            hash: rec.hash,
-            size: rec.size,
-            path,
-            source: rec.path,
-        }))
+        Ok(Some((idx, rec)))
     }
-}
-
-pub(crate) struct Union {
-    pub idx: usize,
-    pub hash: [u8; 32],
-    pub size: u64,
-    pub path: Vec<u8>,
-    pub source: Vec<u8>,
 }
 
 pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
@@ -232,7 +227,7 @@ pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
     // Per-hash group state; a group is the run of records sharing a hash.
     let mut group: Option<([u8; 32], u64, usize)> = None;
     let mut members: Vec<usize> = Vec::new();
-    let mut seen_paths: HashSet<Vec<u8>> = HashSet::new();
+    let mut last_path: Option<Vec<u8>> = None;
 
     let mut close_group = |members: &mut Vec<usize>, size: u64, shards: &mut Vec<ShardStats>| {
         members.sort_unstable();
@@ -261,20 +256,19 @@ pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
         members.clear();
     };
 
-    while let Some(u) = stream.next()? {
-        let idx = u.idx;
+    while let Some((idx, rec)) = stream.next()? {
         shards[idx].files += 1;
-        shards[idx].bytes += u.size;
+        shards[idx].bytes += rec.size;
         match group {
-            Some((h, size, first_idx)) if h == u.hash => {
-                if size != u.size {
+            Some((h, size, first_idx)) if h == rec.hash => {
+                if size != rec.size {
                     return Err(Error::Malformed {
                         path: stream.path(idx).to_path_buf(),
                         line: 0,
                         msg: format!(
                             "hash {} has size {} here but size {size} in {}",
                             hex::encode(&h),
-                            u.size,
+                            rec.size,
                             stream.path(first_idx).display()
                         ),
                     });
@@ -282,19 +276,24 @@ pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
             }
             Some((_, size, _)) => {
                 close_group(&mut members, size, &mut shards);
-                group = Some((u.hash, u.size, idx));
-                seen_paths.clear();
+                group = Some((rec.hash, rec.size, idx));
+                last_path = None;
             }
-            None => group = Some((u.hash, u.size, idx)),
+            None => group = Some((rec.hash, rec.size, idx)),
         }
         members.push(idx);
-        if seen_paths.insert(u.path.clone()) {
+        // Same (hash, path) from several shards arrives adjacent, so this counts
+        // distinct pairs.
+        if last_path.as_deref() != Some(&rec.path[..]) {
             union.materialised_paths += 1;
-            let mut line = pathenc::encode(&u.path);
-            line.push(b'\t');
-            line.extend_from_slice(hex::encode(&u.hash).as_bytes());
-            by_path.push(line).at(&tmp)?;
+            last_path = Some(rec.path.clone());
         }
+        let mut line = pathenc::encode(&rec.path);
+        line.push(b'\t');
+        line.extend_from_slice(hex::encode(&rec.hash).as_bytes());
+        line.push(b'\t');
+        line.extend_from_slice(idx.to_string().as_bytes());
+        by_path.push(line).at(&tmp)?;
     }
     if let Some((_, size, _)) = group {
         close_group(&mut members, size, &mut shards);
@@ -325,9 +324,15 @@ pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
     let sample = collisions
         .iter()
         .take(COLLISION_SAMPLE)
-        .map(|(p, hs)| CollisionSample {
+        .map(|(p, claims)| CollisionSample {
             path: pathenc::display(p),
-            hashes: hs.iter().map(|h| hex::encode(h)).collect(),
+            claims: claims
+                .iter()
+                .map(|c| ClaimSample {
+                    hash: hex::encode(&c.hash),
+                    shards: c.shards.clone(),
+                })
+                .collect(),
         })
         .collect();
     let report = PlanReport {
@@ -343,35 +348,51 @@ pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
     Ok(Plan { report, collisions })
 }
 
-/// Lines are `encoded_path \t hex`, sorted, so a path's hashes are adjacent and ascending.
+/// Lines are `encoded_path \t hex \t shard`, sorted, so a path's claims are
+/// adjacent and in ascending hash order.
 fn find_collisions(
     sorted: impl Iterator<Item = std::io::Result<Vec<u8>>>,
     tmp: &Path,
-) -> Result<BTreeMap<Vec<u8>, Vec<[u8; 32]>>> {
-    let mut out = BTreeMap::new();
-    let mut cur: Option<(Vec<u8>, Vec<[u8; 32]>)> = None;
+) -> Result<BTreeMap<Vec<u8>, Vec<Claim>>> {
     let corrupt = || Error::Malformed {
         path: tmp.to_path_buf(),
         line: 0,
         msg: "corrupt sort spill".into(),
     };
+    let mut out = BTreeMap::new();
+    let mut cur: Option<(Vec<u8>, Vec<Claim>)> = None;
+    let mut flush = |cur: Option<(Vec<u8>, Vec<Claim>)>| -> Result<()> {
+        if let Some((p, claims)) = cur.filter(|(_, c)| c.len() > 1) {
+            out.insert(pathenc::decode(&p).map_err(|_| corrupt())?, claims);
+        }
+        Ok(())
+    };
     for line in sorted {
         let line = line.at(tmp)?;
-        let split = line.len().checked_sub(65).ok_or_else(corrupt)?;
-        let (enc, hex_part) = (&line[..split], &line[split + 1..]);
+        let t2 = line.iter().rposition(|&b| b == b'\t').ok_or_else(corrupt)?;
+        let t1 = line[..t2]
+            .iter()
+            .rposition(|&b| b == b'\t')
+            .ok_or_else(corrupt)?;
+        let (enc, hex_part, idx_part) = (&line[..t1], &line[t1 + 1..t2], &line[t2 + 1..]);
         let hash = hex::decode_hash(hex_part).ok_or_else(corrupt)?;
-        match &mut cur {
-            Some((p, hs)) if p.as_slice() == enc => hs.push(hash),
-            _ => {
-                if let Some((p, hs)) = cur.take().filter(|(_, hs)| hs.len() > 1) {
-                    out.insert(pathenc::decode(&p).map_err(|_| corrupt())?, hs);
-                }
-                cur = Some((enc.to_vec(), vec![hash]));
-            }
+        let idx: usize = std::str::from_utf8(idx_part)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(corrupt)?;
+        if cur.as_ref().is_none_or(|(p, _)| p.as_slice() != enc) {
+            flush(cur.take())?;
+            cur = Some((enc.to_vec(), Vec::new()));
+        }
+        let claims = &mut cur.as_mut().ok_or_else(corrupt)?.1;
+        match claims.last_mut() {
+            Some(c) if c.hash == hash => c.shards.push(idx),
+            _ => claims.push(Claim {
+                hash,
+                shards: vec![idx],
+            }),
         }
     }
-    if let Some((p, hs)) = cur.filter(|(_, hs)| hs.len() > 1) {
-        out.insert(pathenc::decode(&p).map_err(|_| corrupt())?, hs);
-    }
+    flush(cur)?;
     Ok(out)
 }
