@@ -12,7 +12,8 @@ use crate::extsort::Sorter;
 use crate::fsutil::{self, fsync_dir, write_atomic};
 use crate::hash::{BUF_SIZE, copy_hashing, hash_file};
 use crate::hex;
-use crate::index::{IndexWriter, line_into};
+use crate::index::{IndexReader, IndexWriter, Record, line_into};
+use crate::pathenc;
 use crate::plan::{self, Input, Plan, PlanOptions};
 use crate::shard::Layout;
 
@@ -27,6 +28,8 @@ pub struct MergeOptions {
     pub link: bool,
     pub dedupe_links: bool,
     pub index_dir: Option<PathBuf>,
+    /// Places every source path under this relative directory in the output.
+    pub under: Option<Vec<u8>>,
     pub pairwise: Option<bool>,
     pub sort_budget: usize,
 }
@@ -34,7 +37,10 @@ pub struct MergeOptions {
 pub struct MergePlan {
     pub plan: Plan,
     roots: Vec<PathBuf>,
-    indexes: Vec<PathBuf>,
+    inputs: Vec<Input>,
+    /// Input 0 is the output's own existing index. Its files are already in
+    /// place, and index 0 sorts it first among records with identical lines.
+    target: bool,
 }
 
 impl MergePlan {
@@ -44,6 +50,15 @@ impl MergePlan {
     /// path collisions.
     pub fn blocked_by_collisions(&self, layout: OutputLayout) -> bool {
         layout == OutputLayout::Paths && !self.plan.collisions.is_empty()
+    }
+
+    /// Where input `idx`'s file for an output path lives.
+    pub fn source(&self, idx: usize, path: &[u8]) -> PathBuf {
+        self.roots[idx].join(bytes_path(&path[self.inputs[idx].prefix.len()..]))
+    }
+
+    fn held(&self, idx: usize) -> bool {
+        self.target && idx == 0
     }
 }
 
@@ -90,7 +105,38 @@ pub fn prepare(roots: &[PathBuf], into: &Path, opts: &MergeOptions) -> Result<Me
         return Err(Error::Usage("merge needs at least one source shard".into()));
     }
     let into_c = canonical_lenient(into)?;
-    let mut indexes = Vec::with_capacity(roots.len());
+    let prefix = match &opts.under {
+        None => Vec::new(),
+        Some(p) => {
+            let mut p = p.as_slice();
+            while let Some(rest) = p.strip_suffix(b"/") {
+                p = rest;
+            }
+            pathenc::validate_relative(p)
+                .map_err(|e| Error::Usage(format!("--under {}: {e}", pathenc::display(p))))?;
+            [p, b"/"].concat()
+        }
+    };
+    let out = Layout::in_shard(into);
+    let target = out.index.is_file();
+    let mut all_roots = Vec::with_capacity(roots.len() + 1);
+    let mut inputs = Vec::with_capacity(roots.len() + 1);
+    if target {
+        let hashed = out.dir.join("paths").is_file();
+        if hashed != (opts.layout == OutputLayout::Hash) {
+            return Err(Error::Usage(format!(
+                "{} already holds a merge in the {} layout; merge into it with the same --layout",
+                into.display(),
+                if hashed { "hash" } else { "paths" }
+            )));
+        }
+        all_roots.push(into.to_path_buf());
+        inputs.push(Input {
+            label: into.display().to_string(),
+            index: out.index,
+            prefix: Vec::new(),
+        });
+    }
     for root in roots {
         if !root.is_dir() {
             return Err(Error::Usage(format!(
@@ -99,6 +145,9 @@ pub fn prepare(roots: &[PathBuf], into: &Path, opts: &MergeOptions) -> Result<Me
             )));
         }
         let root_c = fs::canonicalize(root).at(root)?;
+        if target && root_c == into_c {
+            continue;
+        }
         if into_c.starts_with(&root_c) || root_c.starts_with(&into_c) {
             return Err(Error::Usage(format!(
                 "output {} overlaps source shard {}",
@@ -114,16 +163,13 @@ pub fn prepare(roots: &[PathBuf], into: &Path, opts: &MergeOptions) -> Result<Me
                 layout.index.display()
             )));
         }
-        indexes.push(layout.index);
+        all_roots.push(root.clone());
+        inputs.push(Input {
+            label: root.display().to_string(),
+            index: layout.index,
+            prefix: prefix.clone(),
+        });
     }
-    let inputs: Vec<Input> = roots
-        .iter()
-        .zip(&indexes)
-        .map(|(r, i)| Input {
-            label: r.display().to_string(),
-            index: i.clone(),
-        })
-        .collect();
     let plan = plan::plan(
         &inputs,
         &PlanOptions {
@@ -134,8 +180,9 @@ pub fn prepare(roots: &[PathBuf], into: &Path, opts: &MergeOptions) -> Result<Me
 
     Ok(MergePlan {
         plan,
-        roots: roots.to_vec(),
-        indexes,
+        roots: all_roots,
+        inputs,
+        target,
     })
 }
 
@@ -335,6 +382,7 @@ pub fn execute(
     into: &Path,
     opts: &MergeOptions,
     log: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(u64),
 ) -> Result<MergeReport> {
     if mp.blocked_by_collisions(opts.layout) {
         return Err(Error::Usage(format!(
@@ -348,7 +396,13 @@ pub fn execute(
     let paths_file = out_layout.dir.join("paths");
     let mut paths_index = match opts.layout {
         OutputLayout::Hash => {
-            Some(Sorter::new(&out_layout.dir, opts.sort_budget).at(&out_layout.dir)?)
+            let mut s = Sorter::new(&out_layout.dir, opts.sort_budget).at(&out_layout.dir)?;
+            if mp.target {
+                for rec in IndexReader::open(&paths_file)? {
+                    s.push(rec?.line()).at(&paths_file)?;
+                }
+            }
+            Some(s)
         }
         OutputLayout::Paths => None,
     };
@@ -365,59 +419,80 @@ pub fn execute(
         last_flush: Instant::now(),
         log,
     };
-    let mut stream = plan::MergeStream::open(&mp.indexes)?;
 
-    // Group state: the source chosen for the current hash and the first output
-    // path holding it (for dedupe links).
-    let mut cur: Option<([u8; 32], PathBuf, Option<PathBuf>)> = None;
-    let mut last_path: Option<Vec<u8>> = None;
-
-    while let Some((idx, rec)) = stream.next()? {
-        let new_group = cur.as_ref().is_none_or(|(h, _, _)| *h != rec.hash);
-        if new_group {
-            cur = Some((rec.hash, mp.roots[idx].join(bytes_path(&rec.path)), None));
-        } else if last_path.as_deref() == Some(&rec.path[..]) {
-            continue;
-        }
-        last_path = Some(rec.path.clone());
-        if let Some(pi) = paths_index.as_mut() {
-            pi.push(rec.line()).at(&paths_file)?;
-        }
-
-        let out_rel = match opts.layout {
-            OutputLayout::Hash => {
-                if !new_group {
-                    continue;
-                }
-                hash_layout_path(&rec.hash)
-            }
-            OutputLayout::Paths => rec.path.clone(),
+    // One hash's records, buffered so a copy already held by the output is
+    // known before any path of that hash is placed.
+    let mut place_group = |group: &[(usize, Record)]| -> Result<()> {
+        let Some((_, head)) = group.first() else {
+            return Ok(());
         };
-        let Some((hash, src, first_out)) = cur.as_mut() else {
-            continue;
-        };
-        match writer.place(&out_rel, src, hash, rec.size, first_out.as_deref()) {
-            Outcome::Failed(reason) => {
-                report.failed.push(Failure {
-                    path: out_rel,
-                    reason,
-                });
+        let mut first_out = group
+            .iter()
+            .find(|(i, _)| mp.held(*i))
+            .map(|(_, r)| into.join(bytes_path(&r.path)));
+        let held = first_out.is_some();
+        let mut last_path: Option<&[u8]> = None;
+        for (n, (i, rec)) in group.iter().enumerate() {
+            if last_path == Some(&rec.path[..]) {
                 continue;
             }
-            Outcome::Written(n) => {
-                report.written += 1;
-                report.bytes_written += n;
+            last_path = Some(&rec.path);
+            let mine = mp.held(*i);
+            if !mine && let Some(pi) = paths_index.as_mut() {
+                pi.push(rec.line()).at(&paths_file)?;
             }
-            Outcome::Linked => report.linked += 1,
-            Outcome::Existing => report.existing += 1,
+            let out_rel = match opts.layout {
+                OutputLayout::Paths => rec.path.clone(),
+                OutputLayout::Hash if mine || (!held && n == 0) => hash_layout_path(&head.hash),
+                OutputLayout::Hash => continue,
+            };
+            progress(head.size);
+            let outcome = if mine {
+                Outcome::Existing
+            } else {
+                writer.place(
+                    &out_rel,
+                    &mp.source(*i, &rec.path),
+                    &head.hash,
+                    head.size,
+                    first_out.as_deref(),
+                )
+            };
+            match outcome {
+                Outcome::Failed(reason) => {
+                    report.failed.push(Failure {
+                        path: out_rel,
+                        reason,
+                    });
+                    continue;
+                }
+                Outcome::Written(n) => {
+                    report.written += 1;
+                    report.bytes_written += n;
+                }
+                Outcome::Linked => report.linked += 1,
+                Outcome::Existing => report.existing += 1,
+            }
+            if first_out.is_none() {
+                first_out = Some(into.join(bytes_path(&out_rel)));
+            }
+            let mut line = Vec::new();
+            line_into(&head.hash, head.size, &out_rel, &mut line);
+            out_index.push(line).at(&out_layout.dir)?;
         }
-        if first_out.is_none() {
-            *first_out = Some(into.join(bytes_path(&out_rel)));
+        Ok(())
+    };
+
+    let mut stream = plan::MergeStream::open(&mp.inputs)?;
+    let mut group: Vec<(usize, Record)> = Vec::new();
+    while let Some(item) = stream.next()? {
+        if group.first().is_some_and(|(_, r)| r.hash != item.1.hash) {
+            place_group(&group)?;
+            group.clear();
         }
-        let mut line = Vec::new();
-        line_into(hash, rec.size, &out_rel, &mut line);
-        out_index.push(line).at(&out_layout.dir)?;
+        group.push(item);
     }
+    place_group(&group)?;
 
     writer.flush_device().at(into)?;
 
@@ -425,8 +500,13 @@ pub fn execute(
         let sorted = pi.finish().at(&out_layout.dir)?;
         write_atomic(&paths_file, |w| {
             let mut iw = IndexWriter::new(w)?;
+            let mut prev = None;
             for line in sorted {
-                iw.write_line(&line?)?;
+                let line = line?;
+                if prev.as_ref() != Some(&line) {
+                    iw.write_line(&line)?;
+                }
+                prev = Some(line);
             }
             iw.finish()
         })

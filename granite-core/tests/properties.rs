@@ -37,7 +37,7 @@ fn scan_opts(force: bool) -> ScanOptions {
 }
 
 fn do_scan(root: &Path, force: bool) -> Vec<u8> {
-    scan::scan(root, &scan_opts(force), &mut |_| {}).unwrap();
+    scan::scan(root, &scan_opts(force), &mut |_| {}, &mut |_| {}).unwrap();
     fs::read(root.join(".granite/index")).unwrap()
 }
 
@@ -47,24 +47,35 @@ fn merge_opts() -> MergeOptions {
         link: false,
         dedupe_links: true,
         index_dir: None,
+        under: None,
         pairwise: None,
         sort_budget: DEFAULT_SORT_BUDGET,
     }
 }
 
+fn do_merge(roots: &[PathBuf], into: &Path) -> MergeReport {
+    merge_with(roots, into, &merge_opts())
+}
+
 /// The only tolerated failure is the NFC/NFD pair on a normalisation-folding
 /// filesystem (APFS), where the second spelling cannot be materialised.
-fn do_merge(roots: &[PathBuf], into: &Path) -> MergeReport {
-    let opts = merge_opts();
-    let mp = merge::prepare(roots, into, &opts).unwrap();
-    let r = merge::execute(&mp, into, &opts, &mut |_| {}).unwrap();
+fn merge_with(roots: &[PathBuf], into: &Path, opts: &MergeOptions) -> MergeReport {
+    let mp = merge::prepare(roots, into, opts).unwrap();
+    let r = merge::execute(&mp, into, opts, &mut |_| {}, &mut |_| {}).unwrap();
     for f in &r.failed {
-        assert!(
-            f.path.starts_with(b"unicode/") && f.reason.contains("normalisation"),
-            "{f:?}"
-        );
+        assert!(f.reason.contains("normalisation"), "{f:?}");
     }
     r
+}
+
+fn do_verify(root: &Path) -> verify::VerifyReport {
+    let opts = VerifyOptions {
+        jobs: 2,
+        index_dir: None,
+        name: None,
+        sort_budget: DEFAULT_SORT_BUDGET,
+    };
+    verify::verify(root, &opts, &mut |_| {}).unwrap()
 }
 
 fn read_tree(root: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
@@ -258,6 +269,7 @@ fn plan_matches_merge() {
         .map(|t| Input {
             label: String::new(),
             index: t.join(".granite/index"),
+            prefix: Vec::new(),
         })
         .collect();
     let p = plan::plan(
@@ -284,16 +296,7 @@ fn plan_matches_merge() {
     );
     assert_eq!(p.report.collisions.count, 0);
     assert_eq!(p.report.shards[3].files, 0);
-    let verified = verify::verify(
-        &out,
-        &VerifyOptions {
-            jobs: 2,
-            index_dir: None,
-            name: None,
-            sort_budget: DEFAULT_SORT_BUDGET,
-        },
-    )
-    .unwrap();
+    let verified = do_verify(&out);
     assert!(verified.is_clean(), "{verified:?}");
 }
 
@@ -340,7 +343,13 @@ fn interrupted_scan_resumes() {
     .unwrap();
 
     let mut notes = Vec::new();
-    scan::scan(&root, &scan_opts(true), &mut |m| notes.push(m.to_owned())).unwrap();
+    scan::scan(
+        &root,
+        &scan_opts(true),
+        &mut |m| notes.push(m.to_owned()),
+        &mut |_| {},
+    )
+    .unwrap();
     assert!(notes.iter().any(|n| n.contains("resuming")), "{notes:?}");
     assert_eq!(fs::read(root.join(".granite/index")).unwrap(), full);
     assert!(!root.join(".granite/scan.journal").exists());
@@ -377,7 +386,7 @@ fn collisions_block_paths_layout_with_locations() {
         "{claims:?}"
     );
     assert!(mp.blocked_by_collisions(OutputLayout::Paths));
-    assert!(merge::execute(&mp, &out, &opts, &mut |_| {}).is_err());
+    assert!(merge::execute(&mp, &out, &opts, &mut |_| {}, &mut |_| {}).is_err());
     assert!(!out.exists());
 
     let hashed = MergeOptions {
@@ -386,7 +395,7 @@ fn collisions_block_paths_layout_with_locations() {
     };
     let mp = merge::prepare(&roots, &out, &hashed).unwrap();
     assert!(!mp.blocked_by_collisions(OutputLayout::Hash));
-    let r = merge::execute(&mp, &out, &hashed, &mut |_| {}).unwrap();
+    let r = merge::execute(&mp, &out, &hashed, &mut |_| {}, &mut |_| {}).unwrap();
     assert!(r.failed.is_empty(), "{:?}", r.failed);
 }
 
@@ -399,24 +408,72 @@ fn hash_layout_has_no_collisions() {
         ..merge_opts()
     };
     let mp = merge::prepare(&f.shards, &out, &opts).unwrap();
-    let r = merge::execute(&mp, &out, &opts, &mut |_| {}).unwrap();
+    let r = merge::execute(&mp, &out, &opts, &mut |_| {}, &mut |_| {}).unwrap();
     assert!(r.failed.is_empty(), "{:?}", r.failed);
     assert_eq!(r.written, mp.plan.report.union.distinct_hashes);
     assert_eq!(
         records(&out.join(".granite/paths")).len() as u64,
         mp.plan.report.union.materialised_paths
     );
-    let verified = verify::verify(
-        &out,
-        &VerifyOptions {
-            jobs: 2,
-            index_dir: None,
-            name: None,
-            sort_budget: DEFAULT_SORT_BUDGET,
-        },
-    )
-    .unwrap();
+    let verified = do_verify(&out);
     assert!(verified.is_clean());
+}
+
+#[test]
+fn merging_one_shard_at_a_time_matches_merging_all() {
+    let f = fixture();
+    for layout in [OutputLayout::Paths, OutputLayout::Hash] {
+        let opts = MergeOptions {
+            layout,
+            ..merge_opts()
+        };
+        let flat = f.base.join(format!("flat-{layout:?}"));
+        merge_with(&f.shards, &flat, &opts);
+        let steps = f.base.join(format!("steps-{layout:?}"));
+        for s in &f.shards {
+            merge_with(std::slice::from_ref(s), &steps, &opts);
+        }
+        assert_eq!(read_tree(&steps), read_tree(&flat));
+        assert!(do_verify(&steps).is_clean());
+    }
+
+    let d = f.base.join("d");
+    tree(&d, &[(b"notes.txt", b"notes version D")]);
+    do_scan(&d, true);
+    let mp = merge::prepare(&[d], &f.base.join("steps-Paths"), &merge_opts()).unwrap();
+    assert!(mp.blocked_by_collisions(OutputLayout::Paths));
+}
+
+#[test]
+fn under_prefixes_sources_and_locates_claimants() {
+    let f = fixture();
+    let out = f.base.join("out");
+    let under = |p: &str| MergeOptions {
+        under: Some(p.as_bytes().to_vec()),
+        ..merge_opts()
+    };
+    merge_with(&f.shards[..1], &out, &under("x/"));
+    let d = f.base.join("d");
+    tree(&d, &[(b"notes.txt", b"notes version D")]);
+    do_scan(&d, true);
+
+    let mp = merge::prepare(std::slice::from_ref(&d), &out, &under("x")).unwrap();
+    let (path, claims) = mp.plan.collisions.iter().unwrap().next().unwrap().unwrap();
+    assert_eq!(path, b"x/notes.txt");
+    let locs: Vec<PathBuf> = claims
+        .iter()
+        .flat_map(|c| &c.shards)
+        .map(|&i| mp.source(i, &path))
+        .collect();
+    assert!(locs.contains(&out.join("x/notes.txt")), "{locs:?}");
+    assert!(locs.contains(&d.join("notes.txt")), "{locs:?}");
+
+    merge_with(&[d], &out, &under("y"));
+    assert_eq!(
+        fs::read(out.join("y/notes.txt")).unwrap(),
+        b"notes version D"
+    );
+    assert!(do_verify(&out).is_clean());
 }
 
 #[test]

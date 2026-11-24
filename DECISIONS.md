@@ -96,8 +96,8 @@ the merge did not write.
 - **Hints and the resume set are held in memory** (a hash map keyed by path).
   The external sort keeps the index build out of RAM as required; the hint
   map is roughly 100 bytes per file, which is acceptable at ten million files.
-- **No progress output** during scan or merge. The journal's line count is
-  the progress indicator for now.
+- **Progress** for scan, merge and verify is drawn on stderr only when it is
+  a terminal, so scripted output is unchanged.
 - **A file that changes type between the walk and the hash** (regular file
   replaced by a symlink) is recorded in `skipped`.
 - **YAML crate**: `yaml-rust2` (0.12, maintained under the saphyr project).

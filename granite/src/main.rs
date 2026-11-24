@@ -1,6 +1,8 @@
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -9,6 +11,7 @@ use granite_core::plan::{self, PlanOptions, PlanReport};
 use granite_core::scan::{self, ScanOptions};
 use granite_core::verify::{self, VerifyOptions};
 use granite_core::{DEFAULT_SORT_BUDGET, Error, default_jobs, hex_encode, index, pathenc, shard};
+use indicatif::{ProgressBar, ProgressStyle};
 
 const EXIT_CODES: &str = "\
 Exit codes:
@@ -92,6 +95,9 @@ enum Cmd {
         /// Location of the sources' indexes when kept outside the shards
         #[arg(long, value_name = "DIR")]
         index_dir: Option<PathBuf>,
+        /// Place every source path under this directory in the output
+        #[arg(long, value_name = "PREFIX")]
+        under: Option<PathBuf>,
         #[arg(long)]
         pairwise: bool,
         #[command(flatten)]
@@ -132,8 +138,33 @@ fn main() -> ExitCode {
     }
 }
 
-fn log(msg: &str) {
-    eprintln!("{msg}");
+/// Drawn on stderr, and only when stderr is a terminal.
+fn progress(template: &str, len: Option<u64>) -> ProgressBar {
+    let bar = match len {
+        Some(n) => ProgressBar::new(n),
+        None => ProgressBar::no_length(),
+    };
+    bar.set_style(ProgressStyle::with_template(template).expect("valid template"));
+    bar.enable_steady_tick(Duration::from_millis(200));
+    bar
+}
+
+fn hashing() -> ProgressBar {
+    let bar = progress(
+        "{spinner} {msg} files, {binary_bytes} ({binary_bytes_per_sec}) [{elapsed}]",
+        None,
+    );
+    bar.set_message("0");
+    bar
+}
+
+fn tick_hashed(bar: &ProgressBar) -> impl FnMut(u64) {
+    let mut files = 0u64;
+    move |size| {
+        files += 1;
+        bar.inc(size);
+        bar.set_message(files.to_string());
+    }
 }
 
 fn run(cli: Cli) -> anyhow::Result<u8> {
@@ -152,7 +183,14 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
                 jobs,
                 sort_budget: sort.sort_budget << 20,
             };
-            let r = scan::scan(&root, &opts, &mut log)?;
+            let bar = hashing();
+            let r = scan::scan(
+                &root,
+                &opts,
+                &mut |m| bar.suspend(|| eprintln!("{m}")),
+                &mut tick_hashed(&bar),
+            )?;
+            bar.finish_and_clear();
             println!(
                 "indexed {} files, {} bytes; skipped {}",
                 r.files_indexed, r.bytes_indexed, r.files_skipped
@@ -180,7 +218,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
                 serde_json::to_writer_pretty(&mut out, &p.report)?;
                 writeln!(out)?;
             } else {
-                print_plan(&mut out, &p.report)?;
+                print_plan(&mut out, &p.report, true)?;
             }
             Ok(0)
         }
@@ -192,6 +230,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             dedupe_links,
             dry_run,
             index_dir,
+            under,
             pairwise,
             sort,
         } => {
@@ -203,13 +242,14 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
                 link,
                 dedupe_links,
                 index_dir,
+                under: under.map(|u| u.as_os_str().as_bytes().to_vec()),
                 pairwise: pairwise.then_some(true),
                 sort_budget: sort.sort_budget << 20,
             };
             let mp = merge::prepare(&targets, &into, &opts)?;
             let mut out = std::io::stdout().lock();
             if dry_run {
-                print_plan(&mut out, &mp.plan.report)?;
+                print_plan(&mut out, &mp.plan.report, false)?;
                 if mp.blocked_by_collisions(opts.layout) {
                     print_collisions(&mut out, &mp)?;
                 }
@@ -225,7 +265,22 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
                 print_collisions(&mut err, &mp)?;
                 return Ok(1);
             }
-            let r = merge::execute(&mp, &into, &opts, &mut log)?;
+            let u = &mp.plan.report.union;
+            let bar = progress(
+                "{wide_bar} {human_pos}/{human_len} files [{elapsed}<{eta}]",
+                Some(match opts.layout {
+                    OutputLayout::Paths => u.materialised_paths,
+                    OutputLayout::Hash => u.distinct_hashes,
+                }),
+            );
+            let r = merge::execute(
+                &mp,
+                &into,
+                &opts,
+                &mut |m| bar.suspend(|| eprintln!("{m}")),
+                &mut |_| bar.inc(1),
+            )?;
+            bar.finish_and_clear();
             writeln!(
                 out,
                 "wrote {} files ({} bytes), linked {}, already present {}, failed {}",
@@ -253,7 +308,9 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
                 name: loc.name,
                 sort_budget: sort.sort_budget << 20,
             };
-            let r = verify::verify(&root, &opts)?;
+            let bar = hashing();
+            let r = verify::verify(&root, &opts, &mut tick_hashed(&bar))?;
+            bar.finish_and_clear();
             let mut out = std::io::stdout().lock();
             if let Some(at) = &r.scanned_at {
                 writeln!(out, "index scanned at {at}")?;
@@ -307,7 +364,9 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
     }
 }
 
-fn print_plan(out: &mut impl Write, r: &PlanReport) -> std::io::Result<()> {
+/// `samples` lists example collisions by shard; merge prints its own complete
+/// list instead, with locations adjusted for `--under`.
+fn print_plan(out: &mut impl Write, r: &PlanReport, samples: bool) -> std::io::Result<()> {
     let w = r
         .shards
         .iter()
@@ -377,7 +436,7 @@ fn print_plan(out: &mut impl Write, r: &PlanReport) -> std::io::Result<()> {
             out,
             "  paths claimed by more than one file; merge --layout paths refuses until these are renamed"
         )?;
-        for c in &r.collisions.sample {
+        for c in r.collisions.sample.iter().filter(|_| samples) {
             writeln!(out, "  {}", c.path)?;
             for claim in &c.claims {
                 for &i in &claim.shards {
@@ -389,7 +448,7 @@ fn print_plan(out: &mut impl Write, r: &PlanReport) -> std::io::Result<()> {
                 }
             }
         }
-        if r.collisions.count as usize > r.collisions.sample.len() {
+        if samples && r.collisions.count as usize > r.collisions.sample.len() {
             writeln!(
                 out,
                 "  ... and {} more",
@@ -403,7 +462,6 @@ fn print_plan(out: &mut impl Write, r: &PlanReport) -> std::io::Result<()> {
 /// The complete resolution list: every colliding path, and where each
 /// claimant lives so the user can rename one and rescan that shard.
 fn print_collisions(out: &mut impl Write, mp: &MergePlan) -> anyhow::Result<()> {
-    let labels = &mp.plan.report.shards;
     writeln!(out)?;
     writeln!(
         out,
@@ -417,9 +475,9 @@ fn print_collisions(out: &mut impl Write, mp: &MergePlan) -> anyhow::Result<()> 
             for &i in &claim.shards {
                 writeln!(
                     out,
-                    "      {}  {}/{shown}",
+                    "      {}  {}",
                     hex_encode(&claim.hash),
-                    labels[i].label
+                    pathenc::display(mp.source(i, &path).as_os_str().as_bytes())
                 )?;
             }
         }

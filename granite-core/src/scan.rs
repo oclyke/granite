@@ -32,7 +32,12 @@ pub struct ScanReport {
     pub layout: Layout,
 }
 
-pub fn scan(root: &Path, opts: &ScanOptions, log: &mut dyn FnMut(&str)) -> Result<ScanReport> {
+pub fn scan(
+    root: &Path,
+    opts: &ScanOptions,
+    log: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(u64),
+) -> Result<ScanReport> {
     require_dir(root)?;
     let started_at = rfc3339_now();
     let layout = Layout::resolve(root, opts.index_dir.as_deref(), opts.name.as_deref()).at(root)?;
@@ -107,6 +112,7 @@ pub fn scan(root: &Path, opts: &ScanOptions, log: &mut dyn FnMut(&str)) -> Resul
                 mtime_nanos,
                 hash,
             } => {
+                progress(size);
                 jw.append(&journal::Entry {
                     hash,
                     size,

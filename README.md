@@ -137,6 +137,18 @@ writes each distinct content once at `objects/<xx>/<hash>` with a
 `.granite/paths` index mapping hashes to their paths; nothing can collide.
 
 `DIR` gets its own `.granite/index`, so it is a shard and can be merged again.
+If `DIR` already has an index, it is an implicit input: `merge B --into DIR`
+is `merge DIR B --into DIR`, so drives can be added one at a time. Files
+already in `DIR` are trusted rather than re-read, collisions against them are
+reported like any other, and a new path whose content `DIR` already holds is
+hardlinked to it. `--layout` must match the layout `DIR` was built with.
+
+`--under PREFIX` places every source path under `PREFIX/` in the output,
+which keeps unrelated drives from colliding:
+
+```
+$ granite merge /mnt/old-laptop --into /tank --under 2014-laptop
+```
 
 ### `granite verify <ROOT>`
 

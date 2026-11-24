@@ -72,7 +72,11 @@ fn decode(enc: &[u8], tmp: &Path) -> Result<Vec<u8>> {
     })
 }
 
-pub fn verify(root: &Path, opts: &VerifyOptions) -> Result<VerifyReport> {
+pub fn verify(
+    root: &Path,
+    opts: &VerifyOptions,
+    progress: &mut dyn FnMut(u64),
+) -> Result<VerifyReport> {
     require_dir(root)?;
     let layout = Layout::resolve(root, opts.index_dir.as_deref(), opts.name.as_deref()).at(root)?;
     let tmp = std::env::temp_dir();
@@ -103,7 +107,12 @@ pub fn verify(root: &Path, opts: &VerifyOptions) -> Result<VerifyReport> {
     }
     .run(|item| {
         match item {
-            Item::File { path, hash, .. } => actual.push(line(&path, &hash)).at(&tmp)?,
+            Item::File {
+                path, hash, size, ..
+            } => {
+                progress(size);
+                actual.push(line(&path, &hash)).at(&tmp)?
+            }
             Item::Skipped { path, reason } => {
                 let benign = reason == "empty directory"
                     || reason == "symlink"

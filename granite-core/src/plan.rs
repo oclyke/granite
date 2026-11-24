@@ -26,6 +26,8 @@ pub struct Input {
     /// What the user typed; used for display only.
     pub label: String,
     pub index: PathBuf,
+    /// Prepended to every path read from this input; empty or ending in `/`.
+    pub prefix: Vec<u8>,
 }
 
 pub fn inputs_for_targets(targets: &[PathBuf]) -> Vec<Input> {
@@ -34,6 +36,7 @@ pub fn inputs_for_targets(targets: &[PathBuf]) -> Vec<Input> {
         .map(|t| Input {
             label: t.display().to_string(),
             index: index_for_target(t),
+            prefix: Vec::new(),
         })
         .collect()
 }
@@ -241,27 +244,40 @@ impl Ord for Entry {
 }
 
 /// Yields `(input index, record)` in line-bytewise order across all inputs.
+/// A constant prefix keeps each input's records in line order, so the merge
+/// stays sorted when it is applied on read.
 pub(crate) struct MergeStream {
     readers: Vec<IndexReader<BufReader<File>>>,
+    prefixes: Vec<Vec<u8>>,
     heap: BinaryHeap<Reverse<Entry>>,
 }
 
 impl MergeStream {
-    pub(crate) fn open(indexes: &[PathBuf]) -> Result<Self> {
-        let mut readers = Vec::with_capacity(indexes.len());
-        let mut heap = BinaryHeap::with_capacity(indexes.len());
-        for (idx, path) in indexes.iter().enumerate() {
-            let mut r = IndexReader::open(path)?;
-            if let Some(rec) = r.next().transpose()? {
-                heap.push(Reverse(Entry {
-                    line: rec.line(),
-                    idx,
-                    rec,
-                }));
-            }
-            readers.push(r);
+    pub(crate) fn open(inputs: &[Input]) -> Result<Self> {
+        let mut s = MergeStream {
+            readers: Vec::with_capacity(inputs.len()),
+            prefixes: inputs.iter().map(|i| i.prefix.clone()).collect(),
+            heap: BinaryHeap::with_capacity(inputs.len()),
+        };
+        for (idx, input) in inputs.iter().enumerate() {
+            s.readers.push(IndexReader::open(&input.index)?);
+            s.refill(idx)?;
         }
-        Ok(MergeStream { readers, heap })
+        Ok(s)
+    }
+
+    fn refill(&mut self, idx: usize) -> Result<()> {
+        if let Some(mut rec) = self.readers[idx].next().transpose()? {
+            if !self.prefixes[idx].is_empty() {
+                rec.path = [&self.prefixes[idx][..], &rec.path].concat();
+            }
+            self.heap.push(Reverse(Entry {
+                line: rec.line(),
+                idx,
+                rec,
+            }));
+        }
+        Ok(())
     }
 
     pub(crate) fn path(&self, idx: usize) -> &Path {
@@ -272,21 +288,14 @@ impl MergeStream {
         let Some(Reverse(Entry { idx, rec, .. })) = self.heap.pop() else {
             return Ok(None);
         };
-        if let Some(next) = self.readers[idx].next().transpose()? {
-            self.heap.push(Reverse(Entry {
-                line: next.line(),
-                idx,
-                rec: next,
-            }));
-        }
+        self.refill(idx)?;
         Ok(Some((idx, rec)))
     }
 }
 
 pub fn plan(inputs: &[Input], opts: &PlanOptions) -> Result<Plan> {
     let n = inputs.len();
-    let indexes: Vec<PathBuf> = inputs.iter().map(|i| i.index.clone()).collect();
-    let mut stream = MergeStream::open(&indexes)?;
+    let mut stream = MergeStream::open(inputs)?;
     let want_pairwise = opts.pairwise.unwrap_or(n <= PAIRWISE_AUTO_LIMIT);
 
     let tmp = std::env::temp_dir();
