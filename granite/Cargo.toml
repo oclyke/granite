@@ -4,6 +4,7 @@ description = "Merge old drives and partial copies into one deduplicated archive
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 readme = "../README.md"
 keywords = ["dedupe", "backup", "archive", "merge", "storage"]
 categories = ["command-line-utilities", "filesystem"]
