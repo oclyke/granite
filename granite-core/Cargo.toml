@@ -1,5 +1,6 @@
 [package]
 name = "granite-core"
+description = "Library behind granite-merge: content-addressed indexes, planning and merging of file collections"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,13 +1,21 @@
 [package]
-name = "granite"
+name = "granite-merge"
+description = "Merge old drives and partial copies into one deduplicated archive of plain files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "../README.md"
+keywords = ["dedupe", "backup", "archive", "merge", "storage"]
+categories = ["command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "granite"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-granite-core = { path = "../granite-core" }
+granite-core.workspace = true
 indicatif.workspace = true
 serde_json.workspace = true
 

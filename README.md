@@ -25,8 +25,10 @@ is a set union.
 ## Install
 
 ```
-cargo install --path granite
+cargo install granite-merge
 ```
+
+This installs the `granite` command.
 
 Linux and macOS. Rust 2024 edition.
 

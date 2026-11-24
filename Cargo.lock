@@ -372,19 +372,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "granite"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "granite-core",
- "indicatif",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "granite-core"
 version = "0.1.0"
 dependencies = [
@@ -396,6 +383,19 @@ dependencies = [
  "thiserror",
  "walkdir",
  "yaml-rust2",
+]
+
+[[package]]
+name = "granite-merge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "granite-core",
+ "indicatif",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
